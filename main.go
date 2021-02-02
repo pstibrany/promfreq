@@ -2,101 +2,158 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
-
-	flag "github.com/spf13/pflag"
 
 	"github.com/mattn/go-runewidth"
 )
 
 func main() {
-	var usage = `Usage: freq [options] [-]
-
-Options:
-  -h, --help            Show this help message and exit.
-  --histogram           Prints a histogram. Requires numeric-only input.
-  --summary             Prints a summary.
-  --sort-by=<order>     Specify sort order: one of count, label (default is count).
-  --desc                Sort buckets in descending order (default is false).
-  --justify             Aligns categories and ranges to the right.
-  --column-width=<num>  Width of the largest bin (default is 30).
-  --buckets=<num>       Number of histogram buckets (default is 10).
-`
-
-	var (
-		histogram   = flag.BoolP("histogram", "", false, "")
-		summary     = flag.BoolP("summary", "", false, "")
-		sortBy      = flag.StringP("sort-by", "", "count", "")
-		columnWidth = flag.Float64P("column-width", "", 30, "")
-		desc        = flag.BoolP("desc", "", false, "")
-		justify     = flag.BoolP("justify", "", false, "")
-		buckets     = flag.IntP("buckets", "", 10, "")
-	)
-
-	flag.Usage = func() {
-		fmt.Fprint(os.Stderr, usage)
-	}
+	start := flag.Float64("start", 1, "Start value for linear or exponential buckets.")
+	factor := flag.Float64("factor", 5, "Factor used when computing exponential buckets.")
+	width := flag.Float64("width", 1, "Width of linear buckets")
+	count := flag.Int("count", 10, "Number of linear or exponential buckets")
+	mode := flag.String("mode", "linear", "Linear or exponential.")
+	columnWidth := flag.Int("column-width", 30, "Width of the largest bin")
+	explicitBounds := flag.String("buckets", "", "Explicit buckets: comma separated bucket boundaries.")
 
 	flag.Parse()
 
 	scanner := bufio.NewScanner(os.Stdin)
 
-	var vals []string
+	var bounds []float64
+	var err error
+
+	if *explicitBounds != "" {
+		bounds, err = parseBucketBoundaries(*explicitBounds)
+	} else if *mode == "linear" || *mode == "lin" {
+		bounds, err = linearBuckets(*start, *width, *count)
+	} else if *mode == "exponential" || *mode == "exp" {
+		bounds, err = exponentialBuckets(*start, *factor, *count)
+	}
+
+	if err != nil {
+		printlnAndExit("Failed to create buckets:", err)
+	}
+
+	buckets, sum, samples, min, max := parseValues(scanner, bounds)
+
+	printHistogram(os.Stdout, buckets, samples, float64(*columnWidth), true)
+	printSummary(os.Stdout, buckets, sum, samples, min, max)
+}
+
+func parseBucketBoundaries(inp string) ([]float64, error) {
+	s := strings.Split(inp, ",")
+
+	result := make([]float64, 0, len(s))
+	for _, b := range s {
+		v, err := strconv.ParseFloat(b, 64)
+		if err != nil {
+			return nil, fmt.Errorf("non-numeric input: %q", b)
+		}
+		result = append(result, v)
+	}
+
+	sort.Float64s(result)
+	return result, nil
+}
+
+// Returns sum of values for each bucket, total sum and total number of samples. One extra bucket for values larger
+// than latest bucket is created. Input buckets must be sorted.
+func parseValues(scanner *bufio.Scanner, buckets []float64) (result []promBucket, sum, count, min, max float64) {
+	result = make([]promBucket, len(buckets)+1)
+	for ix := 0; ix < len(buckets); ix++ {
+		result[ix].upperBound = buckets[ix]
+	}
+	result[len(buckets)].upperBound = math.Inf(1)
+
+	first := true
+
 	for scanner.Scan() {
-		vals = append(vals, strings.TrimSpace(scanner.Text()))
-	}
-
-	if len(vals) == 0 {
-		os.Exit(0)
-	}
-
-	if *histogram {
-		// Histograms requires numerical data, so we need to make sure every
-		// line is a number.
-		var samples []float64
-
-		for _, v := range vals {
-			sample, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "found non-numerical input:", v)
-				os.Exit(1)
-			}
-
-			samples = append(samples, sample)
+		v := strings.TrimSpace(scanner.Text())
+		sample, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			printlnAndExit("found non-numerical input:", v)
 		}
 
-		buckets, edges := hist(samples, *buckets)
-
-		printHistogram(os.Stdout, buckets, edges, *columnWidth, *justify)
-
-		if *summary {
-			printSummary(os.Stdout, samples)
+		if first {
+			min = sample
+			max = sample
+			first = false
 		}
-	} else {
-		buckets := categoricalBuckets(vals)
 
-		// In contrast to histograms, bar charts allow you to sort the bars.
-		sortBuckets(buckets, *sortBy, *desc)
-
-		printBarChart(os.Stdout, buckets, *columnWidth, *justify)
-
-		if *summary {
-			printSummary(os.Stdout, frequenciesFloat64(buckets))
+		if sample < min {
+			min = sample
 		}
+		if sample > max {
+			max = sample
+		}
+
+		// Increment all buckets where sample is <= upperBound.
+		for ix := sort.SearchFloat64s(buckets, sample); ix < len(result); ix++ {
+			result[ix].count++
+		}
+		sum += sample
+		count++
 	}
+
+	return
+}
+
+func linearBuckets(start, width float64, count int) ([]float64, error) {
+	if count < 1 {
+		return nil, fmt.Errorf("--linear-buckets needs a positive count")
+	}
+	buckets := make([]float64, count)
+	for i := range buckets {
+		buckets[i] = start
+		start += width
+	}
+	return buckets, nil
+}
+
+func exponentialBuckets(start, factor float64, count int) ([]float64, error) {
+	if count < 1 {
+		return nil, fmt.Errorf("exponential buckets need a positive count")
+	}
+	if start <= 0 {
+		return nil, fmt.Errorf("exponential buckets need a positive start value")
+	}
+	if factor <= 1 {
+		return nil, fmt.Errorf("exponential buckets need a factor greater than 1")
+	}
+	buckets := make([]float64, count)
+	for i := range buckets {
+		buckets[i] = start
+		start *= factor
+	}
+	return buckets, nil
+}
+
+func printlnAndExit(a ...interface{}) {
+	fmt.Fprintln(os.Stderr, a...)
+	os.Exit(1)
 }
 
 // printHistogram displays a histogram. The bar width determines the width of
 // the widest bar. Labels can optionally be right justified.
-func printHistogram(out io.Writer, buckets [][]float64, edges []float64, barWidth float64, justify bool) {
+func printHistogram(out io.Writer, buckets []promBucket, samples float64, barWidth float64, justify bool) {
 	var labels []string
-	for i := 0; i < len(edges)-1; i++ {
-		labels = append(labels, fmt.Sprintf("%.6g-%.6g", edges[i], edges[i+1]))
+	for i := 0; i < len(buckets); i++ {
+		switch {
+		case i == 0:
+			labels = append(labels, fmt.Sprintf("(-∞ .. %0.6g]", buckets[i].upperBound))
+		case i == len(buckets)-1:
+			labels = append(labels, fmt.Sprintf("(%.6g .. +∞)", buckets[i-1].upperBound))
+		default:
+			labels = append(labels, fmt.Sprintf("(%.6g .. %.6g]", buckets[i-1].upperBound, buckets[i].upperBound))
+		}
 	}
 
 	var (
@@ -104,34 +161,34 @@ func printHistogram(out io.Writer, buckets [][]float64, edges []float64, barWidt
 		labelWidth = maxStringWidth(labels)
 	)
 
-	for idx, bucket := range buckets {
-		var (
-			normalizedWidth = float64(len(bucket)) / maxFreq
-			width           = normalizedWidth * barWidth
-			prefix          = paddedString(labels[idx], labelWidth, justify)
-		)
+	prev := float64(0)
+	for ix := range buckets {
+		bucketSamples := buckets[ix].count - prev
+		normalizedWidth := bucketSamples / maxFreq
+		prev = buckets[ix].count
 
-		fmt.Fprintf(out, "%s %s %d\n", prefix, column(width), len(bucket))
+		width := normalizedWidth * barWidth
+		prefix := paddedString(labels[ix], labelWidth, justify)
+
+		fmt.Fprintf(out, "%s %s %.0f (%0.1f %%)\n", prefix, column(width), bucketSamples, 100*bucketSamples/samples)
 	}
 }
 
-// printBarChart displays a bar chart. The bar width determines the width of
-// the widest bar. Categories can optionally be right justified.
-func printBarChart(out io.Writer, buckets []bucket, barWidth float64, justify bool) {
-	var (
-		maxFreq       = maxInt(frequencies(buckets))
-		categoryWidth = maxStringWidth(categories(buckets))
-	)
-
-	for _, bucket := range buckets {
-		var (
-			normalizedWidth = float64(bucket.Frequency) / float64(maxFreq)
-			width           = normalizedWidth * barWidth
-			prefix          = paddedString(bucket.Category, categoryWidth, justify)
-		)
-
-		fmt.Fprintf(out, "%s %s %d\n", prefix, column(width), bucket.Frequency)
+func printSummary(out io.Writer, bucketVals []promBucket, sum, samples, min, max float64) {
+	stats := []string{
+		fmt.Sprintf("%s=%.0f", "count", samples),
+		fmt.Sprintf("%s=%g", "p50", bucketQuantile(0.5, bucketVals)),
+		fmt.Sprintf("%s=%g", "p90", bucketQuantile(0.9, bucketVals)),
+		fmt.Sprintf("%s=%g", "p95", bucketQuantile(0.95, bucketVals)),
+		fmt.Sprintf("%s=%g", "p99", bucketQuantile(0.99, bucketVals)),
+		fmt.Sprintf("%s=%g", "avg", sum/samples),
+		fmt.Sprintf("%s=%g", "min", min),
+		fmt.Sprintf("%s=%g", "max", max),
 	}
+
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "summary:")
+	fmt.Fprintln(out, " "+strings.Join(stats, ", "))
 }
 
 // paddedString returns the string justified in a string of given width.
@@ -143,21 +200,12 @@ func paddedString(str string, width int, justify bool) string {
 	return fill(str, width)
 }
 
-// printSummary displays additional statistics about the dataset.
-func printSummary(out io.Writer, numbers []float64) {
-	stats := []string{
-		fmt.Sprintf("%s=%g", "p50", percentile(0.5, numbers)),
-		fmt.Sprintf("%s=%g", "p90", percentile(0.9, numbers)),
-		fmt.Sprintf("%s=%g", "p95", percentile(0.95, numbers)),
-		fmt.Sprintf("%s=%g", "p99", percentile(0.99, numbers)),
-		fmt.Sprintf("%s=%g", "min", minFloat64(numbers)),
-		fmt.Sprintf("%s=%g", "max", maxFloat64(numbers)),
-		fmt.Sprintf("%s=%g", "avg", avgFloat64(numbers)),
-	}
+func fill(s string, w int) string {
+	return s + strings.Repeat(" ", w-runewidth.StringWidth(s))
+}
 
-	fmt.Fprintln(out)
-	fmt.Fprintln(out, "summary:")
-	fmt.Fprintln(out, " "+strings.Join(stats, ", "))
+func just(s string, w int) string {
+	return strings.Repeat(" ", w-runewidth.StringWidth(s)) + s
 }
 
 var boxes = []string{"▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"}
@@ -179,6 +227,19 @@ func maxStringWidth(strs []string) int {
 		w := runewidth.StringWidth(str)
 		if w > max {
 			max = w
+		}
+	}
+
+	return max
+}
+
+func maxFrequency(buckets []promBucket) float64 {
+	var max = buckets[0].count
+
+	for ix := 1; ix < len(buckets); ix++ {
+		d := buckets[ix].count - buckets[ix-1].count
+		if d > max {
+			max = d
 		}
 	}
 
