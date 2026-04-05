@@ -22,10 +22,35 @@ func main() {
 	mode := flag.String("mode", "linear", "Linear or exponential.")
 	columnWidth := flag.Int("column-width", 30, "Width of the largest bin")
 	explicitBounds := flag.String("buckets", "", "Explicit buckets: comma separated bucket boundaries.")
+	schema := flag.Int("schema", 3, "Native histogram schema (0 to 8). Higher values give finer bucket resolution.")
+	maxBuckets := flag.Int("max-buckets", 128, "Maximum number of buckets for native histograms. Set to 0 for unlimited.")
 
 	flag.Parse()
 
+	// Check which flags were explicitly set by the user.
+	useLegacy := false
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "mode", "buckets", "start", "factor", "width", "count":
+			useLegacy = true
+		}
+	})
+
 	scanner := bufio.NewScanner(os.Stdin)
+
+	if !useLegacy {
+		if *schema < 0 || *schema > 8 {
+			printlnAndExit("Schema must be between 0 and 8.")
+		}
+		hist := parseValuesNative(scanner, int32(*schema))
+		if *maxBuckets > 0 {
+			hist.reduceResolution(*maxBuckets)
+		}
+		buckets := hist.toBuckets()
+		printHistogram(os.Stdout, buckets, hist.count, float64(*columnWidth), true)
+		printSummary(os.Stdout, buckets, hist.sum, hist.count, hist.min, hist.max)
+		return
+	}
 
 	var bounds []float64
 	var err error
