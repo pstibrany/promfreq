@@ -31,8 +31,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nNative histogram options (default):\n")
 		printFlag("schema")
 		printFlag("max-buckets")
-		fmt.Fprintf(os.Stderr, "\nLegacy bucket options (setting any of these disables native histograms):\n")
+		fmt.Fprintf(os.Stderr, "\nExplicit bucket boundaries:\n")
 		printFlag("buckets")
+		fmt.Fprintf(os.Stderr, "\nLegacy bucket options (setting any of these disables native histograms):\n")
 		printFlag("mode")
 		printFlag("start")
 		printFlag("width")
@@ -48,14 +49,23 @@ func main() {
 	useLegacy := false
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
-		case "mode", "buckets", "start", "factor", "width", "count":
+		case "mode", "start", "factor", "width", "count":
 			useLegacy = true
 		}
 	})
 
 	scanner := bufio.NewScanner(os.Stdin)
 
-	if !useLegacy {
+	var buckets []promBucket
+	var sum, samples, min, max float64
+
+	if *explicitBounds != "" {
+		bounds, err := parseBucketBoundaries(*explicitBounds)
+		if err != nil {
+			printlnAndExit("Failed to parse buckets:", err)
+		}
+		buckets, sum, samples, min, max = parseValues(scanner, bounds)
+	} else if !useLegacy {
 		if *schema < 0 || *schema > 8 {
 			printlnAndExit("Schema must be between 0 and 8.")
 		}
@@ -63,28 +73,28 @@ func main() {
 		if *maxBuckets > 0 {
 			hist.reduceResolution(*maxBuckets)
 		}
-		buckets := hist.toBuckets()
-		printHistogram(os.Stdout, buckets, hist.count, float64(*columnWidth), true)
-		printSummary(os.Stdout, buckets, hist.sum, hist.count, hist.min, hist.max)
-		return
+		buckets = hist.toBuckets()
+		sum, samples, min, max = hist.sum, hist.count, hist.min, hist.max
+	} else {
+		var bounds []float64
+		var err error
+
+		if *mode == "linear" || *mode == "lin" {
+			bounds, err = linearBuckets(*start, *width, *count)
+		} else if *mode == "exponential" || *mode == "exp" {
+			bounds, err = exponentialBuckets(*start, *factor, *count)
+		}
+
+		if err != nil {
+			printlnAndExit("Failed to create buckets:", err)
+		}
+
+		buckets, sum, samples, min, max = parseValues(scanner, bounds)
 	}
 
-	var bounds []float64
-	var err error
-
-	if *explicitBounds != "" {
-		bounds, err = parseBucketBoundaries(*explicitBounds)
-	} else if *mode == "linear" || *mode == "lin" {
-		bounds, err = linearBuckets(*start, *width, *count)
-	} else if *mode == "exponential" || *mode == "exp" {
-		bounds, err = exponentialBuckets(*start, *factor, *count)
+	if samples == 0 {
+		printlnAndExit("no input values")
 	}
-
-	if err != nil {
-		printlnAndExit("Failed to create buckets:", err)
-	}
-
-	buckets, sum, samples, min, max := parseValues(scanner, bounds)
 
 	printHistogram(os.Stdout, buckets, samples, float64(*columnWidth), true)
 	printSummary(os.Stdout, buckets, sum, samples, min, max)

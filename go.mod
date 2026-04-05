@@ -1,6 +1,6 @@
 module github.com/pstibrany/promfreq
 
-go 1.13
+go 1.21
 
 require (
 	github.com/mattn/go-runewidth v0.0.4
