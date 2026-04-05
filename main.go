@@ -15,15 +15,32 @@ import (
 )
 
 func main() {
+	schema := flag.Int("schema", 3, "Bucket resolution (0-8). Buckets use exponential boundaries with 2^schema buckets per power of 2.")
+	maxBuckets := flag.Int("max-buckets", 128, "Maximum number of buckets. Set to 0 for unlimited.")
+	columnWidth := flag.Int("column-width", 30, "Width of the largest bin.")
+
+	explicitBounds := flag.String("buckets", "", "Comma separated bucket boundaries.")
+	mode := flag.String("mode", "linear", "Bucket mode: linear or exponential.")
 	start := flag.Float64("start", 1, "Start value for linear or exponential buckets.")
-	factor := flag.Float64("factor", 5, "Factor used when computing exponential buckets.")
-	width := flag.Float64("width", 1, "Width of linear buckets")
-	count := flag.Int("count", 10, "Number of linear or exponential buckets")
-	mode := flag.String("mode", "linear", "Linear or exponential.")
-	columnWidth := flag.Int("column-width", 30, "Width of the largest bin")
-	explicitBounds := flag.String("buckets", "", "Explicit buckets: comma separated bucket boundaries.")
-	schema := flag.Int("schema", 3, "Native histogram schema (0 to 8). Higher values give finer bucket resolution.")
-	maxBuckets := flag.Int("max-buckets", 128, "Maximum number of buckets for native histograms. Set to 0 for unlimited.")
+	width := flag.Float64("width", 1, "Width of linear buckets.")
+	factor := flag.Float64("factor", 5, "Factor for exponential buckets.")
+	count := flag.Int("count", 10, "Number of linear or exponential buckets.")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\nReads values from stdin and displays a histogram.\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nNative histogram options (default):\n")
+		printFlag("schema")
+		printFlag("max-buckets")
+		fmt.Fprintf(os.Stderr, "\nLegacy bucket options (setting any of these disables native histograms):\n")
+		printFlag("buckets")
+		printFlag("mode")
+		printFlag("start")
+		printFlag("width")
+		printFlag("factor")
+		printFlag("count")
+		fmt.Fprintf(os.Stderr, "\nDisplay options:\n")
+		printFlag("column-width")
+	}
 
 	flag.Parse()
 
@@ -159,6 +176,20 @@ func exponentialBuckets(start, factor float64, count int) ([]float64, error) {
 		start *= factor
 	}
 	return buckets, nil
+}
+
+func printFlag(name string) {
+	f := flag.Lookup(name)
+	fmt.Fprintf(os.Stderr, "  -%s", f.Name)
+	typeName, usage := flag.UnquoteUsage(f)
+	if typeName != "" {
+		fmt.Fprintf(os.Stderr, " %s", typeName)
+	}
+	fmt.Fprintf(os.Stderr, "\n    \t%s", usage)
+	if f.DefValue != "" {
+		fmt.Fprintf(os.Stderr, " (default %s)", f.DefValue)
+	}
+	fmt.Fprint(os.Stderr, "\n")
 }
 
 func printlnAndExit(a ...interface{}) {
